@@ -1,0 +1,279 @@
+{
+  "name": "wf_error_handler - Global Error Handler",
+  "id": "P11ErrorHandler004",
+  "active": false,
+  "isArchived": false,
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "on-workflow-error",
+      "name": "On Workflow Error",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        -660,
+        300
+      ],
+      "notes": "Fires for any unhandled failure in any workflow that names this as its error workflow.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "\n/**\n * Requirement 4.9 - central error handler.\n * Set as `errorWorkflow` on every other workflow, so any unhandled failure in\n * any node anywhere lands here with the full execution context.\n */\nconst e = $input.first().json ?? {};\n\nconst wf = e.workflow ?? {};\nconst ex = e.execution ?? {};\nconst err = ex.error ?? e.error ?? {};\n\n// Pull the business identifiers out of the failing item if they survived.\nconst lastData = ex.lastNodeExecuted ? (e.execution?.data ?? {}) : {};\nconst traceGuess =\n  err.context?.trace_id ??\n  e.trace_id ??\n  `ERR-${Date.now().toString(36).toUpperCase()}`;\n\nconst severity = /timeout|econnrefused|enotfound|socket|network/i.test(String(err.message))\n  ? 'TRANSIENT'\n  : 'PERMANENT';\n\nreturn [{\n  json: {\n    trace_id: traceGuess,\n    ticket_id: e.ticket_id ?? null,\n    workflow_id: wf.id ?? null,\n    workflow_name: wf.name ?? 'unknown',\n    execution_id: ex.id ?? null,\n    execution_url: ex.url ?? null,\n    failed_node: ex.lastNodeExecuted ?? err.node?.name ?? 'unknown',\n    error_message: String(err.message ?? 'unknown error').slice(0, 1000),\n    error_name: err.name ?? 'WorkflowError',\n    error_description: String(err.description ?? '').slice(0, 1000),\n    error_stack: String(err.stack ?? '').slice(0, 2000),\n    severity,\n    retry_advised: severity === 'TRANSIENT',\n    mode: ex.mode ?? null,\n    detected_at: new Date().toISOString(),\n    raw: e,\n  },\n}];\n"
+      },
+      "id": "extract-error-context",
+      "name": "Extract Error Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -440,
+        300
+      ],
+      "notes": "Normalises the error payload and classifies transient vs permanent.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO app.audit_log (trace_id, ticket_id, workflow_name, execution_id, node_name, event, level, message, payload) VALUES ($1,$2,$3,$4,$5,'UNHANDLED_ERROR','ERROR',$6,$7::jsonb)",
+        "options": {
+          "queryReplacement": "={{ [$json.trace_id, $json.ticket_id, $json.workflow_name, $json.execution_id, $json.failed_node, $json.error_message, JSON.stringify({severity: $json.severity, name: $json.error_name, description: $json.error_description, execution_url: $json.execution_url, mode: $json.mode})] }}"
+        }
+      },
+      "id": "log-unhandled-error",
+      "name": "Log: Unhandled Error",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -220,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "P11PG",
+          "name": "Postgres - Project 11"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "notes": "Every failure gets an ERROR row, queryable by trace_id alongside the successful steps.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE app.tickets SET error_count = error_count + 1 WHERE ticket_id = $1 OR trace_id = $2 RETURNING ticket_id, error_count",
+        "options": {
+          "queryReplacement": "={{ [$('Extract Error Context').item.json.ticket_id, $('Extract Error Context').item.json.trace_id] }}"
+        }
+      },
+      "id": "postgres-increment-error-count",
+      "name": "Postgres: Increment Error Count",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        0,
+        460
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "P11PG",
+          "name": "Postgres - Project 11"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c-50174499",
+              "leftValue": "={{ $('Extract Error Context').item.json.retry_advised }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-transient-failure?",
+      "name": "IF: Transient Failure?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.SERVICE_DESK_FROM || 'servicedesk@tcs-demo.local' }}",
+        "toEmail": "={{ $env.IT_OPS_EMAIL || 'it-ops@tcs-demo.local' }}",
+        "subject": "=[WARN][Automation] Transient failure in {{ $('Extract Error Context').item.json.workflow_name }}",
+        "emailFormat": "html",
+        "html": "=<h3>Transient failure - retry advised</h3><p>{{ $('Extract Error Context').item.json.error_message }}</p><table cellpadding='6' border='1' style='border-collapse:collapse'><tr><td><b>Workflow</b></td><td>{{ $('Extract Error Context').item.json.workflow_name }}</td></tr><tr><td><b>Failed node</b></td><td>{{ $('Extract Error Context').item.json.failed_node }}</td></tr><tr><td><b>Execution</b></td><td>{{ $('Extract Error Context').item.json.execution_id }}</td></tr><tr><td><b>Trace</b></td><td>{{ $('Extract Error Context').item.json.trace_id }}</td></tr></table><p>Likely a network or upstream timeout. Re-run the execution from the n8n executions list once the dependency is healthy.</p>",
+        "options": {}
+      },
+      "id": "email-transient-failure-digest",
+      "name": "Email: Transient Failure Digest",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        220,
+        180
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "P11SMTP",
+          "name": "SMTP - Mailpit (local)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.SERVICE_DESK_FROM || 'servicedesk@tcs-demo.local' }}",
+        "toEmail": "={{ $env.IT_OPS_EMAIL || 'it-ops@tcs-demo.local' }}, {{ $env.ESCALATION_EMAIL || 'it-head@tcs-demo.local' }}",
+        "subject": "=[ERROR][Automation] {{ $('Extract Error Context').item.json.workflow_name }} failed at {{ $('Extract Error Context').item.json.failed_node }}",
+        "emailFormat": "html",
+        "html": "=<h3>Automation failure needing investigation</h3><p style='color:#a11b1b'><b>{{ $('Extract Error Context').item.json.error_name }}:</b> {{ $('Extract Error Context').item.json.error_message }}</p><table cellpadding='6' border='1' style='border-collapse:collapse'><tr><td><b>Workflow</b></td><td>{{ $('Extract Error Context').item.json.workflow_name }}</td></tr><tr><td><b>Failed node</b></td><td>{{ $('Extract Error Context').item.json.failed_node }}</td></tr><tr><td><b>Ticket</b></td><td>{{ $('Extract Error Context').item.json.ticket_id || 'not yet assigned' }}</td></tr><tr><td><b>Trace</b></td><td>{{ $('Extract Error Context').item.json.trace_id }}</td></tr><tr><td><b>Execution</b></td><td>{{ $('Extract Error Context').item.json.execution_id }}</td></tr></table><pre style='background:#f4f4f4;padding:10px;font-size:11px;overflow:auto'>{{ $('Extract Error Context').item.json.error_description }}</pre>",
+        "options": {}
+      },
+      "id": "email-permanent-failure-alert",
+      "name": "Email: Permanent Failure Alert",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        220,
+        400
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "P11SMTP",
+          "name": "SMTP - Mailpit (local)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "content": "## wf_error_handler  (4.9)\n\nNamed as `errorWorkflow` in the settings of every other workflow, so **any** unhandled node failure arrives here with full context.\n\nIt writes an ERROR row to `app.audit_log` under the original `trace_id`, bumps the ticket's error counter, then splits transient (network / timeout - retry advised) from permanent failures and alerts accordingly.\n\nNode-level handling still comes first: retries with backoff, `continueOnFail` on enrichment, and an explicit error output on the ITSM write. This workflow is the last line, not the only line.",
+        "height": 380,
+        "width": 620,
+        "color": 2
+      },
+      "id": "note-298524",
+      "name": "Note 298524",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -660,
+        -140
+      ]
+    }
+  ],
+  "connections": {
+    "On Workflow Error": {
+      "main": [
+        [
+          {
+            "node": "Extract Error Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Error Context": {
+      "main": [
+        [
+          {
+            "node": "Log: Unhandled Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log: Unhandled Error": {
+      "main": [
+        [
+          {
+            "node": "Postgres: Increment Error Count",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "IF: Transient Failure?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Transient Failure?": {
+      "main": [
+        [
+          {
+            "node": "Email: Transient Failure Digest",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Email: Permanent Failure Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "Asia/Kolkata",
+    "executionTimeout": 900
+  },
+  "staticData": null,
+  "meta": {
+    "instanceId": "project11-proitbridge",
+    "templateCredsSetupCompleted": true
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "project-11"
+    }
+  ],
+  "versionId": "1.0.0",
+  "notes": "Central error trigger for Project 11."
+}

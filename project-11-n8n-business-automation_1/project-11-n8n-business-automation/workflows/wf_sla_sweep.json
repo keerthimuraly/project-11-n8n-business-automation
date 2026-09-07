@@ -1,0 +1,339 @@
+{
+  "name": "wf_sla_sweep - SLA Monitoring",
+  "id": "P11SlaSweep00003",
+  "active": false,
+  "isArchived": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "id": "schedule-every-15-minutes",
+      "name": "Schedule: Every 15 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -660,
+        300
+      ],
+      "notes": "4.1 - the scheduled trigger type.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT ticket_id, trace_id, requester_email, requester_name, subject, priority, queue, assignee_email, status, sla_due_at, external_ref, round(EXTRACT(EPOCH FROM (now() - sla_due_at)) / 60) AS minutes_overdue FROM app.tickets WHERE sla_due_at < now() AND NOT sla_breached AND status NOT IN ('Resolved','Closed','Rejected','Rejected-Invalid') ORDER BY priority, sla_due_at LIMIT 50",
+        "options": {
+          "queryReplacement": "={{ [] }}"
+        }
+      },
+      "id": "postgres-find-breached-tickets",
+      "name": "Postgres: Find Breached Tickets",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -440,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "P11PG",
+          "name": "Postgres - Project 11"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "notes": "Reads open tickets past their SLA target.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c-84639064",
+              "leftValue": "={{ $json.ticket_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-any-breaches?",
+      "name": "IF: Any Breaches?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE app.tickets SET sla_breached = TRUE, status = 'Escalated' WHERE ticket_id = $1 RETURNING ticket_id",
+        "options": {
+          "queryReplacement": "={{ [$json.ticket_id] }}"
+        }
+      },
+      "id": "postgres-mark-breached",
+      "name": "Postgres: Mark Breached",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        0,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "P11PG",
+          "name": "Postgres - Project 11"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.ITSM_API_BASE }}/tickets/{{ $('Postgres: Find Breached Tickets').item.json.external_ref }}",
+        "options": {
+          "timeout": 15000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.ITSM_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({status: 'Escalated', escalated: true, resolution_note: 'SLA breached by ' + $('Postgres: Find Breached Tickets').item.json.minutes_overdue + ' minutes'}) }}",
+        "contentType": "json"
+      },
+      "id": "http-escalate-in-itsm",
+      "name": "HTTP: Escalate in ITSM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        220,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.SERVICE_DESK_FROM || 'servicedesk@tcs-demo.local' }}",
+        "toEmail": "={{ $('Postgres: Find Breached Tickets').item.json.assignee_email }}, {{ $env.ESCALATION_EMAIL || 'it-head@tcs-demo.local' }}",
+        "subject": "=[SLA BREACH] {{ $('Postgres: Find Breached Tickets').item.json.ticket_id }} overdue by {{ $('Postgres: Find Breached Tickets').item.json.minutes_overdue }} min",
+        "emailFormat": "html",
+        "html": "=<h3>Service level breached</h3><table cellpadding='6' border='1' style='border-collapse:collapse'><tr><td><b>Ticket</b></td><td>{{ $('Postgres: Find Breached Tickets').item.json.ticket_id }}</td></tr><tr><td><b>Priority</b></td><td>{{ $('Postgres: Find Breached Tickets').item.json.priority }}</td></tr><tr><td><b>Queue</b></td><td>{{ $('Postgres: Find Breached Tickets').item.json.queue }}</td></tr><tr><td><b>Subject</b></td><td>{{ $('Postgres: Find Breached Tickets').item.json.subject }}</td></tr><tr><td><b>Target was</b></td><td>{{ $('Postgres: Find Breached Tickets').item.json.sla_due_at }}</td></tr><tr><td><b>Overdue by</b></td><td>{{ $('Postgres: Find Breached Tickets').item.json.minutes_overdue }} minutes</td></tr></table>",
+        "options": {}
+      },
+      "id": "email-sla-breach-alert",
+      "name": "Email: SLA Breach Alert",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        440,
+        300
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "P11SMTP",
+          "name": "SMTP - Mailpit (local)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO app.audit_log (trace_id, ticket_id, workflow_name, execution_id, node_name, event, level, message, payload) VALUES ($1,$2,$3,$4,'Email: SLA Breach Alert','SLA_BREACHED','WARN',$5,$6::jsonb)",
+        "options": {
+          "queryReplacement": "={{ [$('Postgres: Find Breached Tickets').item.json.trace_id, $('Postgres: Find Breached Tickets').item.json.ticket_id, $workflow.name, $execution.id, 'SLA breached by ' + $('Postgres: Find Breached Tickets').item.json.minutes_overdue + ' minutes', JSON.stringify({queue: $('Postgres: Find Breached Tickets').item.json.queue, priority: $('Postgres: Find Breached Tickets').item.json.priority})] }}"
+        }
+      },
+      "id": "log-sla-escalation",
+      "name": "Log: SLA Escalation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        660,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "P11PG",
+          "name": "Postgres - Project 11"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {},
+      "id": "noop-nothing-to-do",
+      "name": "NoOp: Nothing to Do",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        0,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## wf_sla_sweep - proactive monitoring  (4.1, 4.10)\n\nRuns every 15 minutes, finds open tickets past their SLA target, marks them breached, escalates in the system of record and alerts the queue owner plus the IT head.\n\nThis is the second trigger type in the solution and the piece that makes the automation *proactive* rather than only reactive.",
+        "height": 300,
+        "width": 560,
+        "color": 5
+      },
+      "id": "note-18218",
+      "name": "Note 18218",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -660,
+        -60
+      ]
+    }
+  ],
+  "connections": {
+    "Schedule: Every 15 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Postgres: Find Breached Tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres: Find Breached Tickets": {
+      "main": [
+        [
+          {
+            "node": "IF: Any Breaches?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Any Breaches?": {
+      "main": [
+        [
+          {
+            "node": "Postgres: Mark Breached",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "NoOp: Nothing to Do",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres: Mark Breached": {
+      "main": [
+        [
+          {
+            "node": "HTTP: Escalate in ITSM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP: Escalate in ITSM": {
+      "main": [
+        [
+          {
+            "node": "Email: SLA Breach Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: SLA Breach Alert": {
+      "main": [
+        [
+          {
+            "node": "Log: SLA Escalation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "Asia/Kolkata",
+    "executionTimeout": 900,
+    "errorWorkflow": "P11ErrorHandler004"
+  },
+  "staticData": null,
+  "meta": {
+    "instanceId": "project11-proitbridge",
+    "templateCredsSetupCompleted": true
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "project-11"
+    }
+  ],
+  "versionId": "1.0.0",
+  "notes": "Scheduled SLA breach detection and escalation."
+}

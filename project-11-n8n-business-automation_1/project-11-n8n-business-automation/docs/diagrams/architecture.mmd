@@ -1,0 +1,88 @@
+%% Project 11 - n8n Business Automation Pipeline
+%% Render:  https://mermaid.live   or the Mermaid VS Code extension
+flowchart TB
+    subgraph SRC["Request sources"]
+        FORM["Corporate portal /<br/>Streamlit console"]
+        CURL["API client / curl"]
+        SCHED["Schedule<br/>every 15 min"]
+    end
+
+    subgraph N8N["n8n orchestration layer"]
+        direction TB
+        WH["Webhook<br/>POST /webhook/it-request"]
+        NORM["Normalize Input<br/>mint trace_id + ticket_id"]
+        VAL{"Validate Request<br/>fields · formats · injection"}
+        ENR["Enrich ×3<br/>directory · assets · KB"]
+        AI["AI Triage Classifier<br/>OpenAI · strict JSON"]
+        PARSE["Parse AI Result<br/>defensive + keyword fallback"]
+        RULES["Apply Business Rules<br/>R1–R11"]
+        SW{"Switch<br/>route by queue"}
+        CREATE["Create Ticket<br/>3 retries + backoff"]
+        VERIFY{"external_ref<br/>present?"}
+        APPR{"Requires<br/>approval?"}
+        SUB["wf_approval<br/>Wait ≤ 48h"]
+        FIN["Finalise Record"]
+        NOTIFY["Notify requester<br/>+ assigned queue"]
+        RESP["Respond 200<br/>decision trace"]
+        ERR["wf_error_handler<br/>errorTrigger"]
+        SLA["wf_sla_sweep<br/>escalate overdue"]
+    end
+
+    subgraph EXT["External systems"]
+        ITSM[("Mock ITSM API<br/>directory · assets · KB · tickets")]
+        OPENAI[("OpenAI<br/>chat completions")]
+        SMTP[("SMTP / Mailpit")]
+    end
+
+    subgraph DATA["Persistence"]
+        PG[("Postgres<br/>app.tickets<br/>app.audit_log<br/>app.approvals<br/>app.eval_runs")]
+    end
+
+    subgraph QUEUES["Fulfilment queues"]
+        L1["L1 Service Desk"]
+        L2["L2 Endpoint"]
+        NET["Network Ops"]
+        IAM["IAM Access"]
+        SEC["Security IR"]
+        HR["Human Review"]
+    end
+
+    FORM --> WH
+    CURL --> WH
+    SCHED --> SLA
+    WH --> NORM --> VAL
+    VAL -->|invalid| R400["Respond 400<br/>+ email requester"]
+    VAL -->|valid| ENR
+    ENR <--> ITSM
+    ENR --> AI
+    AI <--> OPENAI
+    AI --> PARSE --> RULES --> SW
+    SW --> L1 & L2 & NET & IAM & SEC & HR
+    L1 & L2 & NET & IAM & SEC & HR --> CREATE
+    CREATE <--> ITSM
+    CREATE -->|error output| EFAIL["Log ERROR<br/>page IT Ops<br/>Respond 502"]
+    CREATE --> VERIFY
+    VERIFY -->|no| EFAIL
+    VERIFY -->|yes| APPR
+    APPR -->|yes| SUB
+    SUB <--> SMTP
+    SUB --> FIN
+    APPR -->|no| FIN
+    FIN --> PG
+    PG --> NOTIFY --> SMTP
+    NOTIFY --> RESP
+    NORM -.audit.-> PG
+    RULES -.audit.-> PG
+    SLA --> PG
+    SLA --> SMTP
+    ERR -.catches any node.-> PG
+    ERR --> SMTP
+
+    classDef ai fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px
+    classDef rule fill:#e6f4ea,stroke:#0b7a3b,stroke-width:2px
+    classDef err fill:#fce8e6,stroke:#b3261e,stroke-width:2px
+    classDef store fill:#fef7e0,stroke:#e8710a,stroke-width:2px
+    class AI,PARSE ai
+    class RULES,VAL rule
+    class EFAIL,ERR,R400 err
+    class PG,ITSM store

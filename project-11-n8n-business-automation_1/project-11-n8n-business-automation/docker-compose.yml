@@ -1,0 +1,143 @@
+name: p11-n8n-automation
+
+# ---------------------------------------------------------------------------
+# Project 11 - n8n Business Automation Pipeline  (TCS / Enterprise IT)
+#
+# Services
+#   postgres  : n8n metadata DB + application DB (tickets, audit_log, approvals)
+#   n8n       : workflow orchestration engine            -> http://localhost:5678
+#   mailpit   : local SMTP sink for notification testing -> http://localhost:8025
+#   itsm-api  : mock external Enterprise IT system       -> http://localhost:8000/docs
+#   ui        : demonstration / operations console       -> http://localhost:8501
+# ---------------------------------------------------------------------------
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: p11-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-n8n}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-n8n_local_pw}
+      POSTGRES_DB: ${POSTGRES_DB:-n8n}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-n8n} -d ${POSTGRES_DB:-n8n}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: p11-n8n
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # --- persistence -----------------------------------------------------
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB:-n8n}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER:-n8n}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD:-n8n_local_pw}
+      DB_POSTGRESDB_SCHEMA: n8n_meta
+      # --- security --------------------------------------------------------
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?set N8N_ENCRYPTION_KEY in .env}
+      # false for plain-http localhost; true when served over https
+      # (GitHub Codespaces, Cloud Run) - .devcontainer/setup.sh sets it.
+      N8N_SECURE_COOKIE: ${N8N_SECURE_COOKIE:-false}
+      N8N_RUNNERS_ENABLED: "true"
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      # --- addressing ------------------------------------------------------
+      N8N_HOST: ${N8N_HOST:-localhost}
+      N8N_PORT: 5678
+      N8N_PROTOCOL: ${N8N_PROTOCOL:-http}
+      WEBHOOK_URL: ${WEBHOOK_URL:-http://localhost:5678/}
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-Asia/Kolkata}
+      TZ: ${GENERIC_TIMEZONE:-Asia/Kolkata}
+      # --- execution logging (requirement 4.10 / 4.11) ---------------------
+      EXECUTIONS_DATA_SAVE_ON_ERROR: all
+      EXECUTIONS_DATA_SAVE_ON_SUCCESS: all
+      EXECUTIONS_DATA_SAVE_ON_PROGRESS: "true"
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: 336
+      N8N_LOG_LEVEL: ${N8N_LOG_LEVEL:-info}
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      # --- values consumed by workflow expressions -------------------------
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      ITSM_API_BASE: http://itsm-api:8000
+      ITSM_API_KEY: ${ITSM_API_KEY:-local-itsm-key}
+      APPROVAL_COST_THRESHOLD: ${APPROVAL_COST_THRESHOLD:-25000}
+      IT_OPS_EMAIL: ${IT_OPS_EMAIL:-it-ops@tcs-demo.local}
+      SERVICE_DESK_FROM: ${SERVICE_DESK_FROM:-servicedesk@tcs-demo.local}
+      PUBLIC_BASE_URL: ${WEBHOOK_URL:-http://localhost:5678/}
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./workflows:/workflows:ro
+    ports:
+      - "${N8N_PORT:-5678}:5678"
+
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: p11-mailpit
+    restart: unless-stopped
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: 1
+      MP_SMTP_AUTH_ALLOW_INSECURE: 1
+    ports:
+      - "1025:1025"   # SMTP  (n8n Email Send credential points here)
+      - "8025:8025"   # Web UI - use for notification screenshots
+
+  itsm-api:
+    build: ./services/itsm-api
+    container_name: p11-itsm-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-n8n}:${POSTGRES_PASSWORD:-n8n_local_pw}@postgres:5432/${POSTGRES_DB:-n8n}
+      ITSM_API_KEY: ${ITSM_API_KEY:-local-itsm-key}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "8000:8000"
+
+  ui:
+    build: ./services/ui
+    container_name: p11-ui
+    restart: unless-stopped
+    depends_on:
+      - itsm-api
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-n8n}:${POSTGRES_PASSWORD:-n8n_local_pw}@postgres:5432/${POSTGRES_DB:-n8n}
+      N8N_WEBHOOK_URL: http://n8n:5678/webhook/it-request
+      ITSM_API_BASE: http://itsm-api:8000
+      ITSM_API_KEY: ${ITSM_API_KEY:-local-itsm-key}
+      # Shown as a clickable link in the console sidebar, so it must be the
+      # address the *browser* can reach, not the container network name.
+      MAILPIT_URL: ${MAILPIT_URL:-http://localhost:8025}
+      # --- branding: white ground + ProITBridge palette from the logo -------
+      LOGO_PATH: /app/assets/proitbridge_logo.png
+      STREAMLIT_THEME_BASE: light
+      STREAMLIT_THEME_BACKGROUND_COLOR: "#FFFFFF"
+      STREAMLIT_THEME_SECONDARY_BACKGROUND_COLOR: "#F7F9FC"
+      STREAMLIT_THEME_TEXT_COLOR: "#1A1F36"
+      STREAMLIT_THEME_PRIMARY_COLOR: "#00AEEF"
+      STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
+    volumes:
+      # Single canonical logo at the project root, mounted read-only - swap the
+      # file and refresh the page, no image rebuild needed.
+      - ./assets:/app/assets:ro
+    ports:
+      - "8501:8501"
+
+volumes:
+  postgres_data:
+  n8n_data:

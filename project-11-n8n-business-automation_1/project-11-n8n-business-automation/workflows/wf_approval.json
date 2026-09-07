@@ -1,0 +1,659 @@
+{
+  "name": "wf_approval - Manager Approval",
+  "id": "P11Approval00002",
+  "active": false,
+  "isArchived": false,
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "ticket_id",
+              "type": "string"
+            },
+            {
+              "name": "trace_id",
+              "type": "string"
+            },
+            {
+              "name": "external_ref",
+              "type": "string"
+            },
+            {
+              "name": "approver_email",
+              "type": "string"
+            },
+            {
+              "name": "requester_email",
+              "type": "string"
+            },
+            {
+              "name": "requester_name",
+              "type": "string"
+            },
+            {
+              "name": "subject",
+              "type": "string"
+            },
+            {
+              "name": "priority",
+              "type": "string"
+            },
+            {
+              "name": "queue",
+              "type": "string"
+            },
+            {
+              "name": "requested_cost",
+              "type": "number"
+            },
+            {
+              "name": "approval_reason",
+              "type": "string"
+            },
+            {
+              "name": "ai_summary",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "id": "when-called-by-main-workflow",
+      "name": "When Called by Main Workflow",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -720,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\n/**\n * Requirement 4.7 - prepare the approval request.\n * A single-use token is minted here and stored in app.approvals, so a decision\n * link cannot be replayed and every decision is attributable.\n */\nconst d = $input.first().json;\nconst hours = Number($env.APPROVAL_TIMEOUT_HOURS || 48);\nconst now = new Date();\n\nconst token = [\n  Date.now().toString(36),\n  Math.random().toString(36).slice(2, 10),\n  Math.random().toString(36).slice(2, 10),\n].join('-').toUpperCase();\n\nreturn [{\n  json: {\n    ...d,\n    approval_id: `APR-${now.getUTCFullYear()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`,\n    approval_token: token,\n    requested_at: now.toISOString(),\n    expires_at: new Date(now.getTime() + hours * 3600000).toISOString(),\n    timeout_hours: hours,\n    cost_display: Number(d.requested_cost || 0).toLocaleString('en-IN'),\n  },\n}];\n"
+      },
+      "id": "prepare-approval-request",
+      "name": "Prepare Approval Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -500,
+        300
+      ],
+      "notes": "Mints a single-use token and the expiry window.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO app.approvals (approval_id, ticket_id, trace_id, approver_email, token, reason, requested_cost, expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (approval_id) DO NOTHING RETURNING approval_id",
+        "options": {
+          "queryReplacement": "={{ [$json.approval_id, $json.ticket_id, $json.trace_id, $json.approver_email, $json.approval_token, $json.approval_reason, $json.requested_cost, $json.expires_at] }}"
+        }
+      },
+      "id": "postgres-record-approval-request",
+      "name": "Postgres: Record Approval Request",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -280,
+        460
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "P11PG",
+          "name": "Postgres - Project 11"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO app.audit_log (trace_id, ticket_id, workflow_name, execution_id, node_name, event, level, message, payload) VALUES ($1,$2,$3,$4,'Prepare Approval Request','APPROVAL_REQUESTED','INFO',$5,$6::jsonb)",
+        "options": {
+          "queryReplacement": "={{ [$json.trace_id, $json.ticket_id, $workflow.name, $execution.id, 'Approval requested from ' + $json.approver_email, JSON.stringify({cost: $json.requested_cost, reason: $json.approval_reason, expires_at: $json.expires_at})] }}"
+        }
+      },
+      "id": "log-approval-requested",
+      "name": "Log: Approval Requested",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -280,
+        620
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "P11PG",
+          "name": "Postgres - Project 11"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.SERVICE_DESK_FROM || 'servicedesk@tcs-demo.local' }}",
+        "toEmail": "={{ $json.approver_email }}",
+        "subject": "=[Approval needed] {{ $json.ticket_id }} - INR {{ $json.cost_display }} - {{ $json.subject }}",
+        "emailFormat": "html",
+        "html": "=<div style='font-family:sans-serif;max-width:640px'><h3 style='margin-bottom:4px'>Authorisation required</h3><p style='color:#555'>An automated IT request from your team needs your decision.</p><table cellpadding='8' border='1' style='border-collapse:collapse;width:100%'><tr><td><b>Ticket</b></td><td>{{ $json.ticket_id }} ({{ $json.external_ref }})</td></tr><tr><td><b>Requester</b></td><td>{{ $json.requester_name }} &lt;{{ $json.requester_email }}&gt;</td></tr><tr><td><b>Request</b></td><td>{{ $json.subject }}</td></tr><tr><td><b>Summary</b></td><td>{{ $json.ai_summary }}</td></tr><tr><td><b>Estimated cost</b></td><td><b>INR {{ $json.cost_display }}</b></td></tr><tr><td><b>Priority</b></td><td>{{ $json.priority }}</td></tr><tr><td><b>Fulfilment queue</b></td><td>{{ $json.queue }}</td></tr><tr><td><b>Why approval is needed</b></td><td>{{ $json.approval_reason }}</td></tr></table><p style='margin:24px 0'><a href='{{ $execution.resumeUrl }}/approve?decision=approve&token={{ $json.approval_token }}&approver={{ $json.approver_email }}' style='background:#0b7a3b;color:#fff;padding:12px 22px;text-decoration:none;border-radius:4px;font-weight:bold'>Approve</a>&nbsp;&nbsp;&nbsp;<a href='{{ $execution.resumeUrl }}/reject?decision=reject&token={{ $json.approval_token }}&approver={{ $json.approver_email }}' style='background:#a11b1b;color:#fff;padding:12px 22px;text-decoration:none;border-radius:4px;font-weight:bold'>Reject</a></p><p style='color:#777;font-size:12px'>This request expires in {{ $json.timeout_hours }} hours ({{ $json.expires_at }}), after which it is escalated automatically.<br>Trace {{ $json.trace_id }} &middot; approval {{ $json.approval_id }} &middot; single-use links.</p></div>",
+        "options": {}
+      },
+      "id": "email-approval-request-to-manager",
+      "name": "Email: Approval Request to Manager",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        -60,
+        300
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "P11SMTP",
+          "name": "SMTP - Mailpit (local)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "4.7 / 4.8 - the approve and reject links are this execution's Wait resume URL.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "resume": "webhook",
+        "limitWaitTime": true,
+        "limitType": "afterTimeInterval",
+        "resumeAmount": 48,
+        "resumeUnit": "hours",
+        "httpMethod": "GET",
+        "responseMode": "onReceived",
+        "options": {
+          "webhookSuffix": "={{ '' }}"
+        }
+      },
+      "id": "wait-manager-decision",
+      "name": "Wait: Manager Decision",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        160,
+        300
+      ],
+      "webhookId": "p11-approval-wait",
+      "notes": "Human-in-the-loop pause. Resumes when the approver clicks a link,\nor times out after 48h and escalates.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "\n/**\n * Interpret what came back from the Wait node.\n *\n * n8n resumes the Wait node when the approver opens the link in the email.\n * The decision travels in the resume URL's query string, so we read it\n * defensively and treat anything unrecognised as an expiry rather than an\n * accidental approval - fail closed, never fail open.\n */\nconst prep = $('Prepare Approval Request').first().json;\n\nlet decision = 'expired';\nlet decidedBy = null;\nlet comment = null;\n\ntry {\n  const resumed = $input.first().json ?? {};\n  const q = resumed.query ?? resumed.body ?? resumed ?? {};\n  const raw = String(q.decision ?? q.action ?? '').toLowerCase();\n\n  if (raw === 'approve' || raw === 'approved' || raw === 'yes') decision = 'approved';\n  else if (raw === 'reject' || raw === 'rejected' || raw === 'no') decision = 'rejected';\n\n  // Token check: the link must carry the token we minted for this request.\n  const token = String(q.token ?? '');\n  if (decision !== 'expired' && token && token !== prep.approval_token) {\n    decision = 'expired';\n    comment = 'Token mismatch - decision rejected as invalid.';\n  }\n\n  decidedBy = q.approver ?? prep.approver_email;\n  comment = comment ?? (q.comment ? String(q.comment).slice(0, 500) : null);\n} catch (e) {\n  comment = `Could not read approval response: ${e.message}`;\n}\n\nconst expired = decision === 'expired';\n\nreturn [{\n  json: {\n    ...prep,\n    approval_status: decision,\n    decided_by: decidedBy,\n    comment,\n    decided_at: new Date().toISOString(),\n    escalate: expired,\n    new_ticket_status:\n      decision === 'approved' ? 'Approved'\n      : decision === 'rejected' ? 'Rejected'\n      : 'Escalated',\n  },\n}];\n"
+      },
+      "id": "interpret-decision",
+      "name": "Interpret Decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        380,
+        300
+      ],
+      "notes": "Fails closed: an unreadable or token-mismatched response is treated as expired.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE app.approvals SET decision = $1, decided_at = now(), decided_by = $2, comment = $3 WHERE approval_id = $4 RETURNING approval_id, decision",
+        "options": {
+          "queryReplacement": "={{ [$json.approval_status, $json.decided_by, $json.comment, $json.approval_id] }}"
+        }
+      },
+      "id": "postgres-save-decision",
+      "name": "Postgres: Save Decision",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        600,
+        460
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "P11PG",
+          "name": "Postgres - Project 11"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO app.audit_log (trace_id, ticket_id, workflow_name, execution_id, node_name, event, level, message, payload) VALUES ($1,$2,$3,$4,'Interpret Decision','APPROVAL_DECIDED',$5,$6,$7::jsonb)",
+        "options": {
+          "queryReplacement": "={{ [$json.trace_id, $json.ticket_id, $workflow.name, $execution.id, $json.approval_status === 'expired' ? 'WARN' : 'INFO', 'Approval ' + $json.approval_status + ' by ' + ($json.decided_by || 'nobody (timeout)'), JSON.stringify({decision: $json.approval_status, comment: $json.comment, cost: $json.requested_cost})] }}"
+        }
+      },
+      "id": "log-approval-decided",
+      "name": "Log: Approval Decided",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        600,
+        620
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "P11PG",
+          "name": "Postgres - Project 11"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.ITSM_API_BASE }}/tickets/{{ $json.external_ref }}",
+        "options": {
+          "timeout": 15000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.ITSM_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({status: $json.new_ticket_status, approval_status: $json.approval_status, approver_email: $json.decided_by, escalated: $json.escalate, resolution_note: $json.comment}) }}",
+        "contentType": "json"
+      },
+      "id": "http-update-ticket-status",
+      "name": "HTTP: Update Ticket Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        600,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "4.6 - push the decision back to the system of record.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "c-71437826",
+                    "leftValue": "={{ $('Interpret Decision').item.json.approval_status }}",
+                    "rightValue": "approved",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Approved"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "c-27320125",
+                    "leftValue": "={{ $('Interpret Decision').item.json.approval_status }}",
+                    "rightValue": "rejected",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Rejected"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "Expired"
+        }
+      },
+      "id": "switch-decision-outcome",
+      "name": "Switch: Decision Outcome",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        820,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.SERVICE_DESK_FROM || 'servicedesk@tcs-demo.local' }}",
+        "toEmail": "={{ $('Interpret Decision').item.json.requester_email }}",
+        "subject": "=[Approved] {{ $('Interpret Decision').item.json.ticket_id }} - {{ $('Interpret Decision').item.json.subject }}",
+        "emailFormat": "html",
+        "html": "=<p>Good news - your request was approved by {{ $('Interpret Decision').item.json.decided_by }}.</p><p><b>{{ $('Interpret Decision').item.json.subject }}</b><br>Estimated cost: INR {{ $('Interpret Decision').item.json.cost_display }}</p><p>The {{ $('Interpret Decision').item.json.queue }} team will now action it under the {{ $('Interpret Decision').item.json.priority }} service level.</p><p style='color:#666;font-size:12px'>Trace {{ $('Interpret Decision').item.json.trace_id }}</p>",
+        "options": {}
+      },
+      "id": "email-approved",
+      "name": "Email: Approved",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1040,
+        140
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "P11SMTP",
+          "name": "SMTP - Mailpit (local)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.SERVICE_DESK_FROM || 'servicedesk@tcs-demo.local' }}",
+        "toEmail": "={{ $('Interpret Decision').item.json.requester_email }}",
+        "subject": "=[Not approved] {{ $('Interpret Decision').item.json.ticket_id }} - {{ $('Interpret Decision').item.json.subject }}",
+        "emailFormat": "html",
+        "html": "=<p>Your request was not approved by {{ $('Interpret Decision').item.json.decided_by }}.</p><p><b>{{ $('Interpret Decision').item.json.subject }}</b><br>Estimated cost: INR {{ $('Interpret Decision').item.json.cost_display }}</p>{{ $('Interpret Decision').item.json.comment ? '<p><b>Note from approver:</b> ' + $('Interpret Decision').item.json.comment + '</p>' : '' }}<p>The ticket has been closed. Please raise a new request with additional justification if this is still needed.</p><p style='color:#666;font-size:12px'>Trace {{ $('Interpret Decision').item.json.trace_id }}</p>",
+        "options": {}
+      },
+      "id": "email-rejected",
+      "name": "Email: Rejected",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1040,
+        300
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "P11SMTP",
+          "name": "SMTP - Mailpit (local)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.SERVICE_DESK_FROM || 'servicedesk@tcs-demo.local' }}",
+        "toEmail": "={{ $env.ESCALATION_EMAIL || 'it-head@tcs-demo.local' }}",
+        "subject": "=[Escalation] No approval decision on {{ $('Interpret Decision').item.json.ticket_id }} after {{ $('Interpret Decision').item.json.timeout_hours }}h",
+        "emailFormat": "html",
+        "html": "=<h3>Approval timed out</h3><p>{{ $('Interpret Decision').item.json.approver_email }} did not act on this request within {{ $('Interpret Decision').item.json.timeout_hours }} hours. It is escalated to you.</p><table cellpadding='6' border='1' style='border-collapse:collapse'><tr><td><b>Ticket</b></td><td>{{ $('Interpret Decision').item.json.ticket_id }}</td></tr><tr><td><b>Requester</b></td><td>{{ $('Interpret Decision').item.json.requester_email }}</td></tr><tr><td><b>Request</b></td><td>{{ $('Interpret Decision').item.json.subject }}</td></tr><tr><td><b>Cost</b></td><td>INR {{ $('Interpret Decision').item.json.cost_display }}</td></tr><tr><td><b>Reason</b></td><td>{{ $('Interpret Decision').item.json.approval_reason }}</td></tr></table><p style='color:#666;font-size:12px'>Trace {{ $('Interpret Decision').item.json.trace_id }}</p>",
+        "options": {}
+      },
+      "id": "email-escalate-on-timeout",
+      "name": "Email: Escalate on Timeout",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1040,
+        460
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "P11SMTP",
+          "name": "SMTP - Mailpit (local)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "4.7 Escalation path when the approver never responds.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Hand the decision back to wf_main_triage so it can finish the record.\nconst d = $('Interpret Decision').first().json;\nreturn [{ json: {\n  ticket_id: d.ticket_id,\n  trace_id: d.trace_id,\n  approval_id: d.approval_id,\n  approval_status: d.approval_status,\n  decided_by: d.decided_by,\n  decided_at: d.decided_at,\n  comment: d.comment,\n  escalated: d.escalate,\n  new_ticket_status: d.new_ticket_status,\n} }];\n"
+      },
+      "id": "return-to-main-workflow",
+      "name": "Return to Main Workflow",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1280,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## wf_approval - Human in the loop  (4.7)\n\n1. Mint a single-use token, persist it, log the request.\n2. Email the manager with **Approve** / **Reject** links built from `$execution.resumeUrl`.\n3. **Wait** holds the execution for up to 48 hours.\n4. On resume, the decision is read from the link, the token is verified, and the outcome is pushed to the system of record.\n5. Timeout or an unreadable response is treated as **expired** and escalated - the flow fails closed, never open.",
+        "height": 380,
+        "width": 620,
+        "color": 7
+      },
+      "id": "note-114077",
+      "name": "Note 114077",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -720,
+        -160
+      ]
+    }
+  ],
+  "connections": {
+    "When Called by Main Workflow": {
+      "main": [
+        [
+          {
+            "node": "Prepare Approval Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Approval Request": {
+      "main": [
+        [
+          {
+            "node": "Postgres: Record Approval Request",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Log: Approval Requested",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Email: Approval Request to Manager",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: Approval Request to Manager": {
+      "main": [
+        [
+          {
+            "node": "Wait: Manager Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait: Manager Decision": {
+      "main": [
+        [
+          {
+            "node": "Interpret Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Interpret Decision": {
+      "main": [
+        [
+          {
+            "node": "Postgres: Save Decision",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Log: Approval Decided",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "HTTP: Update Ticket Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP: Update Ticket Status": {
+      "main": [
+        [
+          {
+            "node": "Switch: Decision Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch: Decision Outcome": {
+      "main": [
+        [
+          {
+            "node": "Email: Approved",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Email: Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Email: Escalate on Timeout",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: Approved": {
+      "main": [
+        [
+          {
+            "node": "Return to Main Workflow",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: Rejected": {
+      "main": [
+        [
+          {
+            "node": "Return to Main Workflow",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: Escalate on Timeout": {
+      "main": [
+        [
+          {
+            "node": "Return to Main Workflow",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "Asia/Kolkata",
+    "executionTimeout": 900,
+    "errorWorkflow": "P11ErrorHandler004"
+  },
+  "staticData": null,
+  "meta": {
+    "instanceId": "project11-proitbridge",
+    "templateCredsSetupCompleted": true
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "project-11"
+    }
+  ],
+  "versionId": "1.0.0",
+  "notes": "Approval / escalation sub-workflow for Project 11."
+}
